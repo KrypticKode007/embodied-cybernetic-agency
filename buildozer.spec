@@ -1,7 +1,7 @@
 [app]
 
 # (str) Title of your application
-title = Cybernetic Tester for Robotics,Drones,& Memory Chips
+title = Embodied Cybernetics Agency
 
 # (str) Package name (no spaces, used internally by Android)
 package.name = embodiedcyberneticagency
