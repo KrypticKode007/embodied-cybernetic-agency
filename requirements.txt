@@ -1,0 +1,14 @@
+# requirements.txt
+
+# Core Python version (adjust if needed)
+# python>=3.10
+
+# YAML config loading
+PyYAML>=6.0
+
+# Plotting / analysis (for later results + figures)
+matplotlib>=3.8
+pandas>=2.0
+
+# (Optional) numerical helpers
+numpy>=1.26
