@@ -5,6 +5,7 @@
 
 # YAML config loading
 PyYAML>=6.0
+jsonschema>=4.20
 
 # Plotting / analysis (for later results + figures)
 matplotlib>=3.8

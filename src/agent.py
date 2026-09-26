@@ -2,6 +2,8 @@
 
 import math
 import random
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 
 class WorldModel:
@@ -34,6 +36,98 @@ class TelemetryModel:
     def resource_integrity(self):
         # 1.0 = perfect, 0.0 = fully degraded
         return 0.5 * self.battery + 0.5 * (1.0 - self.temperature)
+
+
+@dataclass
+class StructuralIntegrity:
+    """Normalized structural health signals collected from the runtime."""
+
+    heap_usage_pct: float
+    api_error_rate_5m: float
+    dependency_drift_score: float = 0.0
+    unhandled_exceptions: int = 0
+
+    def __post_init__(self):
+        for field_name in (
+            "heap_usage_pct",
+            "api_error_rate_5m",
+            "dependency_drift_score",
+        ):
+            value = getattr(self, field_name)
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{field_name} must be between 0.0 and 1.0")
+        if (
+            isinstance(self.unhandled_exceptions, bool)
+            or not isinstance(self.unhandled_exceptions, int)
+            or self.unhandled_exceptions < 0
+        ):
+            raise ValueError("unhandled_exceptions must be a non-negative integer")
+
+
+class SelfModelBoundaryMonitor:
+    """Score structural degradation and retain the boundaries crossed."""
+
+    def __init__(self, capacity_limits: Optional[Dict[str, float]] = None):
+        self.limits = {
+            "max_heap_pct": 0.85,
+            "max_error_rate": 0.10,
+            "max_dependency_drift_score": 0.30,
+        }
+        self.limits.update(capacity_limits or {})
+        for name, value in self.limits.items():
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be between 0.0 and 1.0")
+        self.degradation_log: List[str] = []
+        self.is_compromised = False
+
+    def evaluate_structural_degradation(
+        self, status: StructuralIntegrity
+    ) -> Tuple[float, List[str]]:
+        broken_boundaries = []
+        degradation_score = 0.0
+
+        if status.heap_usage_pct > self.limits["max_heap_pct"]:
+            broken_boundaries.append("CRITICAL_HEAP_EXCEEDED")
+            degradation_score += 0.35
+
+        if status.api_error_rate_5m > self.limits["max_error_rate"]:
+            broken_boundaries.append("UNSTABLE_SUBSYSTEM_COMMUNICATION")
+            degradation_score += 0.40
+
+        if status.dependency_drift_score > self.limits["max_dependency_drift_score"]:
+            broken_boundaries.append("DEPENDENCY_ENVIRONMENT_DRIFT")
+            degradation_score += 0.20 * status.dependency_drift_score
+
+        if status.unhandled_exceptions > 0:
+            broken_boundaries.append("STRUCTURAL_INTEGRITY_SHATTERED")
+            degradation_score += 0.25 * min(status.unhandled_exceptions, 4)
+
+        degradation_score = min(1.0, degradation_score)
+        self.is_compromised = degradation_score >= 0.60
+        self.degradation_log.extend(broken_boundaries)
+        return degradation_score, broken_boundaries
+
+
+class ActionSelectionEngine:
+    """Choose a conservative recommendation from a historical memory match."""
+
+    def __init__(self, boundary_monitor: SelfModelBoundaryMonitor):
+        self.boundary_monitor = boundary_monitor
+
+    def resolve_mitigation_strategy(
+        self, memory_match: Dict, similarity_score: float
+    ) -> str:
+        if not math.isfinite(similarity_score) or not 0.0 <= similarity_score <= 1.0:
+            raise ValueError("similarity_score must be between 0.0 and 1.0")
+        if similarity_score < 0.75:
+            return "ABORTED: historical analogy confidence is too low."
+        if self.boundary_monitor.is_compromised:
+            return "THROTTLED: system integrity is compromised; use a safe fallback."
+
+        outcome = memory_match.get("outcome")
+        if not isinstance(outcome, str) or not outcome.strip():
+            return "NO_ACTION: no verified historical recovery is available."
+        return f"RECOMMENDED: {outcome}"
 
 
 class SelfModel:
@@ -98,6 +192,8 @@ class Agent:
         self.telemetry = TelemetryModel() if condition_cfg["telemetry_enabled"] else None
         self.self_model = SelfModel() if condition_cfg["self_model_enabled"] else None
         self.regulator = Regulator(mode_policy=condition_cfg["regulation_mode"])
+        self.boundary_monitor = SelfModelBoundaryMonitor()
+        self.action_selection = ActionSelectionEngine(self.boundary_monitor)
 
         # Risk weights (can later be moved to config)
         self.w_e = 0.4  # prediction error
@@ -123,17 +219,34 @@ class Agent:
         if self.self_model is not None:
             self.self_model.update(prediction_error, resource_integrity)
 
-    def compute_risk(self, error, uncertainty, resource_integrity):
+    def compute_risk(
+        self,
+        error,
+        uncertainty,
+        resource_integrity,
+        structural_integrity: Optional[StructuralIntegrity] = None,
+    ):
         r_t = resource_integrity if resource_integrity is not None else 1.0
         m_t = self.self_model.consistency if self.self_model is not None else 1.0
+        structural_degradation = 0.0
+        if structural_integrity is not None:
+            structural_degradation, _ = self.boundary_monitor.evaluate_structural_degradation(
+                structural_integrity
+            )
 
         R_t = (
             self.w_e * error +
             self.w_u * uncertainty +
             self.w_r * (1.0 - r_t) +
-            self.w_m * (1.0 - m_t)
+            self.w_m * (1.0 - m_t) +
+            0.2 * structural_degradation
         )
-        return R_t
+        return min(1.0, R_t)
+
+    def resolve_mitigation_strategy(self, memory_match, similarity_score):
+        return self.action_selection.resolve_mitigation_strategy(
+            memory_match, similarity_score
+        )
 
     def act(self, mode):
         # Map mode to effort; “shutdown” = zero effort.

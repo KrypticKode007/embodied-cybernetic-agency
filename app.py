@@ -1,7 +1,211 @@
 import random
+import json
+import time
+import uuid
 from collections import deque
-from dataclasses import dataclass
-from typing import Optional
+from copy import deepcopy
+from dataclasses import dataclass, field
+from jsonschema import Draft202012Validator, FormatChecker
+import numpy as np
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+
+# ---------- Episodic memory ----------
+
+
+class EpisodicMemory:
+    """Stores entries that conform to the episodic-memory JSON Schema."""
+
+    def __init__(self):
+        schema_path = Path(__file__).parent / "config" / "episodic_memory.schema.json"
+        with schema_path.open(encoding="utf-8") as schema_file:
+            schema = json.load(schema_file)
+
+        self.validator = Draft202012Validator(
+            schema,
+            format_checker=FormatChecker(),
+        )
+        self.entries = []
+
+    def add(self, entry):
+        stored_entry = deepcopy(entry)
+        self.validator.validate(stored_entry)
+        self.entries.append(stored_entry)
+        return stored_entry
+
+
+@dataclass
+class WorkspaceMessage:
+    source_module: str
+    salience: float
+    affect_vector: Tuple[float, float, float]
+    payload: Dict[str, Any]
+    timestamp: float = field(default_factory=time.time)
+
+
+class GlobalWorkspaceManager:
+    """Select and broadcast the most salient module message."""
+
+    def __init__(self, broadcast_threshold=0.4):
+        self.broadcast_threshold = broadcast_threshold
+        self.subscribers: Dict[str, Callable[[WorkspaceMessage], None]] = {}
+        self.current_global_broadcast: Optional[WorkspaceMessage] = None
+
+    def subscribe(self, module_name: str, callback_function: Callable[[WorkspaceMessage], None]):
+        self.subscribers[module_name] = callback_function
+
+    def compete_for_attention(
+        self, incoming_signals: List[WorkspaceMessage]
+    ) -> Optional[WorkspaceMessage]:
+        if not incoming_signals:
+            return None
+
+        winning_signal = max(incoming_signals, key=lambda message: message.salience)
+        baseline = (
+            self.current_global_broadcast.salience
+            if self.current_global_broadcast is not None
+            else self.broadcast_threshold
+        )
+        if self.current_global_broadcast is None or winning_signal.salience > baseline:
+            self.current_global_broadcast = winning_signal
+            self._broadcast(winning_signal)
+
+        return self.current_global_broadcast
+
+    def _broadcast(self, message: WorkspaceMessage):
+        for module_name, callback in self.subscribers.items():
+            if module_name != message.source_module:
+                callback(message)
+
+
+class EpisodicMemoryVectorDB:
+    """In-memory cosine-similarity index for affect and context anchors."""
+
+    def __init__(self):
+        self.memory_pool: List[Dict[str, Any]] = []
+
+    @staticmethod
+    def _embedding(message: WorkspaceMessage) -> np.ndarray:
+        valence, arousal, urgency = message.affect_vector
+        prediction_error = message.payload.get("prediction_error", 0.0)
+        environmental_stress = message.payload.get("environmental_stress", 0.0)
+        values = np.asarray(
+            [valence, arousal, urgency, prediction_error, environmental_stress],
+            dtype=float,
+        )
+        if values.shape != (5,) or not np.isfinite(values).all():
+            raise ValueError("Workspace message embedding must contain five finite values")
+        return values
+
+    def save_episode(self, message: WorkspaceMessage, outcome: str):
+        memory_entry = {
+            "timestamp": message.timestamp,
+            "embedding": self._embedding(message),
+            "source_module": message.source_module,
+            "payload": deepcopy(message.payload),
+            "outcome": outcome,
+        }
+        self.memory_pool.append(memory_entry)
+        return memory_entry
+
+    def vector_search(
+        self, current_message: WorkspaceMessage, top_k: int = 1
+    ) -> List[Tuple[Dict[str, Any], float]]:
+        if top_k < 0:
+            raise ValueError("top_k must be non-negative")
+        if top_k == 0 or not self.memory_pool:
+            return []
+
+        query_vector = self._embedding(current_message)
+        query_norm = np.linalg.norm(query_vector)
+        results = []
+        for memory in self.memory_pool:
+            stored_vector = memory["embedding"]
+            denominator = query_norm * np.linalg.norm(stored_vector)
+            similarity = (
+                float(np.dot(query_vector, stored_vector) / denominator)
+                if denominator > 0.0
+                else 0.0
+            )
+            results.append((memory, similarity))
+
+        results.sort(key=lambda result: result[1], reverse=True)
+        return results[:top_k]
+
+
+def run_workspace_anomaly_demo():
+    """Demonstrate retrieval of a successful response to a similar crisis."""
+    workspace = GlobalWorkspaceManager()
+    memory_db = EpisodicMemoryVectorDB()
+
+    crisis_message = WorkspaceMessage(
+        source_module="predictive_loop",
+        salience=0.85,
+        affect_vector=(-0.6, 0.9, 0.8),
+        payload={
+            "prediction_error": 0.8,
+            "environmental_stress": 0.7,
+            "description": "unexpected failure root",
+        },
+    )
+    memory_db.save_episode(
+        crisis_message,
+        outcome="Triggered automated cluster throttling; stabilization successful.",
+    )
+
+    calm_message = WorkspaceMessage(
+        source_module="resource_monitor",
+        salience=0.1,
+        affect_vector=(0.9, 0.1, 0.0),
+        payload={
+            "prediction_error": 0.05,
+            "environmental_stress": 0.1,
+            "description": "nominal behavior",
+        },
+    )
+    memory_db.save_episode(
+        calm_message,
+        outcome="Maintained routine charging profile optimization.",
+    )
+
+    retrieved_memories = []
+
+    def memory_subsystem_callback(broadcasted_state: WorkspaceMessage):
+        print("[MEMORY SUB] Analyzing homeostatic signature similarity...")
+        matches = memory_db.vector_search(broadcasted_state, top_k=1)
+        retrieved_memories.extend(matches)
+        if matches and matches[0][1] > 0.80:
+            matched_memory, score = matches[0]
+            print(f" -> Found past analogous incident (similarity: {score:.2f})")
+            print(f" -> Historical resolution: '{matched_memory['outcome']}'")
+        else:
+            print(" -> No clear historical analogy found for this state vector.")
+
+    workspace.subscribe("memory_subsystem", memory_subsystem_callback)
+
+    print("\n--- ANOMALY DETECTED IN EXECUTION LOOP ---")
+    current_anomaly = WorkspaceMessage(
+        source_module="predictive_loop",
+        salience=0.92,
+        affect_vector=(-0.7, 0.95, 0.85),
+        payload={
+            "prediction_error": 0.85,
+            "environmental_stress": 0.65,
+            "error_type": "production_deployment_failed",
+        },
+    )
+    routine_telemetry = WorkspaceMessage(
+        source_module="resource_monitor",
+        salience=0.15,
+        affect_vector=(0.8, 0.2, 0.1),
+        payload={},
+    )
+
+    winning_broadcast = workspace.compete_for_attention(
+        [routine_telemetry, current_anomaly]
+    )
+    return winning_broadcast, retrieved_memories
 
 
 # ---------- Core models ----------
@@ -175,6 +379,9 @@ class LogEntry:
     resource_after: float
     consistency: float
     true_state_after: float
+    episodic_entry: dict
+    workspace_broadcast: Optional[WorkspaceMessage]
+    memory_matches: List[Tuple[Dict[str, Any], float]]
 
 
 # ---------- Agent ----------
@@ -183,6 +390,15 @@ class LogEntry:
 class Agent:
     def __init__(self, name):
         self.name = name
+        self.episodic_memory = EpisodicMemory()
+        self.global_workspace = GlobalWorkspaceManager()
+        self.vector_memory = EpisodicMemoryVectorDB()
+        self.workspace_notifications: Dict[str, WorkspaceMessage] = {}
+        for module_name in ("world_model", "homeostasis", "regulator", "episodic_memory"):
+            self.global_workspace.subscribe(
+                module_name,
+                lambda message, name=module_name: self._receive_workspace_message(name, message),
+            )
         self.world = WorldModel()
         self.telemetry = TelemetryModel()
         self.self_model = SelfModel()
@@ -197,6 +413,13 @@ class Agent:
         self.smoothed_risk = 0.0
         self.risk_smoothing = 0.45
 
+    def record_episode(self, entry):
+        """Validate and store one episodic-memory entry."""
+        return self.episodic_memory.add(entry)
+
+    def _receive_workspace_message(self, module_name, message):
+        self.workspace_notifications[module_name] = message
+
     def compute_risk(self, error, uncertainty, resource_integrity):
         normalized_error = min(1.0, error)
         normalized_uncertainty = min(1.0, uncertainty)
@@ -210,6 +433,44 @@ class Agent:
             + self.w_r * resource_degradation
             + self.w_m * inconsistency,
         )
+
+    def compute_affect(self, prediction_error):
+        battery = self.telemetry.battery
+        temperature = self.telemetry.temperature
+        normalized_error = max(0.0, min(1.0, prediction_error))
+
+        quality_loss = (
+            (1.0 - battery) * 0.4
+            + temperature * 0.4
+            + normalized_error * 0.2
+        )
+        valence = max(-1.0, min(1.0, 1.0 - 2.0 * quality_loss))
+
+        arousal = normalized_error * 0.6
+        if battery < 0.15:
+            arousal += 0.3
+        arousal = max(0.0, min(1.0, arousal))
+
+        battery_urgency = max(0.0, (0.20 - battery) / 0.20)
+        thermal_urgency = max(0.0, (temperature - 0.85) / 0.15)
+        urgency = max(battery_urgency, thermal_urgency)
+        urgency = max(0.0, min(1.0, urgency))
+
+        if valence < -0.4 and urgency > 0.7:
+            dominant_state = "anxious_alarm"
+        elif valence < 0.0 and urgency > 0.3:
+            dominant_state = "stressed_urgent"
+        elif battery < 0.2 and arousal < 0.3:
+            dominant_state = "exhausted_degraded"
+        else:
+            dominant_state = "calm_confident"
+
+        return {
+            "valence": valence,
+            "arousal": arousal,
+            "urgency": urgency,
+            "dominant_state": dominant_state,
+        }
 
     def smooth_risk(self, raw_risk):
         alpha = self.risk_smoothing
@@ -262,6 +523,7 @@ def run_simulation(steps=30, seed=42):
 
     env = Environment()
     agent = Agent(name="cybernetic_agent")
+    session_id = str(uuid.uuid4())
 
     disturbances = [
         Disturbance("none", 0.0),
@@ -320,9 +582,114 @@ def run_simulation(steps=30, seed=42):
             mode=mode,
         )
 
+        affect_before = agent.compute_affect(error)
+        affect_vector = (
+            affect_before["valence"],
+            affect_before["arousal"],
+            affect_before["urgency"],
+        )
+        environmental_stress = max(
+            min(1.0, max(0.0, error)),
+            agent.telemetry.temperature,
+        )
+        workspace_messages = [
+            WorkspaceMessage(
+                source_module="world_model",
+                salience=min(1.0, 0.65 * min(1.0, error) + 0.35 * uncertainty),
+                affect_vector=affect_vector,
+                payload={
+                    "prediction_error": min(1.0, max(0.0, error)),
+                    "environmental_stress": environmental_stress,
+                    "observation": observation,
+                    "prediction": prediction,
+                },
+            ),
+            WorkspaceMessage(
+                source_module="homeostasis",
+                salience=affect_before["urgency"],
+                affect_vector=affect_vector,
+                payload={
+                    "prediction_error": min(1.0, max(0.0, error)),
+                    "environmental_stress": environmental_stress,
+                    "battery_level": agent.telemetry.battery,
+                    "temperature_level": agent.telemetry.temperature,
+                },
+            ),
+            WorkspaceMessage(
+                source_module="regulator",
+                salience=smoothed_risk,
+                affect_vector=affect_vector,
+                payload={
+                    "prediction_error": min(1.0, max(0.0, error)),
+                    "environmental_stress": environmental_stress,
+                    "mode": mode,
+                    "reason": reason,
+                },
+            ),
+        ]
+        previous_broadcast = agent.global_workspace.current_global_broadcast
+        workspace_broadcast = agent.global_workspace.compete_for_attention(
+            workspace_messages
+        )
+        is_new_broadcast = workspace_broadcast is not previous_broadcast
+        memory_matches = (
+            agent.vector_memory.vector_search(workspace_broadcast, top_k=3)
+            if is_new_broadcast and workspace_broadcast is not None
+            else []
+        )
+
         effort = agent.act(mode)
         env.apply_action(effort)
         resource_after = agent.telemetry.resource_integrity()
+        affect_after = agent.compute_affect(error)
+
+        if is_new_broadcast and workspace_broadcast is not None:
+            agent.vector_memory.save_episode(
+                workspace_broadcast,
+                outcome=f"mode={mode};resource_integrity={resource_after:.4f}",
+            )
+
+        association_tags = []
+        if error >= 0.65:
+            association_tags.append("high-prediction-error")
+        if agent.telemetry.temperature >= 0.8:
+            association_tags.append("thermal-throttling")
+        if mode in {"recovery", "shutdown"}:
+            association_tags.append("recovery-sequence")
+
+        episodic_entry = agent.record_episode(
+            {
+                "timestamp": time.time_ns() // 1_000_000,
+                "session_id": session_id,
+                "context": {
+                    "active_goal_id": "stabilize_environment",
+                    "environmental_signature": (
+                        f"observation={observation};prediction={prediction:.4f};"
+                        f"uncertainty={uncertainty:.4f}"
+                    ),
+                },
+                "internal_telemetry_snapshot": {
+                    "battery_level": agent.telemetry.battery,
+                    "temperature_level": agent.telemetry.temperature,
+                    "prediction_delta": min(1.0, max(0.0, error)),
+                },
+                "affective_signature": affect_after,
+                "episodic_payload": {
+                    "action_taken": f"{mode} (effort={effort:.2f})",
+                    "sensory_input_summary": (
+                        f"observation={observation};prediction={prediction:.4f};"
+                        f"error={error:.4f};uncertainty={uncertainty:.4f}"
+                    ),
+                    "result_outcome": (
+                        f"mode={mode};resource_integrity={resource_after:.4f}"
+                    ),
+                    "homeostatic_impact_delta": (
+                        affect_after["valence"] - affect_before["valence"]
+                    ),
+                },
+                "association_tags": association_tags,
+            }
+        )
 
         logs.append(
             LogEntry(
@@ -343,6 +710,9 @@ def run_simulation(steps=30, seed=42):
                 resource_after=resource_after,
                 consistency=agent.self_model.consistency,
                 true_state_after=env.true_state,
+                episodic_entry=episodic_entry,
+                workspace_broadcast=workspace_broadcast,
+                memory_matches=memory_matches,
             )
         )
 
