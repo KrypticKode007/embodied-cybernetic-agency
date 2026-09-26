@@ -11,5 +11,16 @@ jsonschema>=4.20
 matplotlib>=3.8
 pandas>=2.0
 
-# (Optional) numerical helpers
+# Numerical helper libraries
 numpy>=1.26
+scipy>=1.11.4
+
+# App runtime
+fastapi>=0.115.0
+starlette>=0.37.2
+uvicorn>=0.30.0
+httpx>=0.28.1
+anyio>=4.7.0
+
+# Validation
+pytest>=8.0.0
